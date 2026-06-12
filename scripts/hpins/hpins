@@ -1,0 +1,872 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import shutil
+import shlex
+
+OSC = "\033]8;;{url}\a{text}\033]8;;\a"
+CMUX = "/Applications/cmux.app/Contents/Resources/bin/cmux"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Show Hermes Desktop pinned sessions, followed by recent sessions. Cmd-click 'hermes session <id>' to resume in cmux."
+    )
+    sub = parser.add_subparsers(dest="command")
+    open_parser = sub.add_parser("open", help="open/resume a Hermes session in a new cmux workspace")
+    open_parser.add_argument("session_id")
+
+    parser.add_argument(
+        "-n",
+        "--recent",
+        type=int,
+        default=25,
+        help="number of recent non-pinned sessions to show below pins (default: 25)",
+    )
+    parser.add_argument(
+        "--all-recent",
+        action="store_true",
+        help="show all recent sessions instead of limiting to --recent",
+    )
+    link_group = parser.add_mutually_exclusive_group()
+    link_group.add_argument(
+        "--links",
+        action="store_true",
+        help="force clickable terminal hyperlinks",
+    )
+    link_group.add_argument(
+        "--no-links",
+        action="store_true",
+        help="disable clickable terminal hyperlinks",
+    )
+    parser.add_argument(
+        "-c", "--compact",
+        action="store_true",
+        help="compact output (default): show titles only, separated into pinned/recent sections",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="verbose output: show IDs, sources, and timestamps",
+    )
+    parser.add_argument(
+        "--manage",
+        action="store_true",
+        help="interactive multi-select manager: unpin pinned sessions and archive recent sessions",
+    )
+    parser.add_argument(
+        "--chat",
+        nargs="?",
+        const="",
+        metavar="SESSION_ID",
+        help="experimental: pick a pinned/recent session and resume it as chat in this terminal; optionally pass SESSION_ID",
+    )
+    parser.add_argument(
+        "--chat-dry-run",
+        action="store_true",
+        help="with --chat, print the hermes resume command instead of executing it",
+    )
+    parser.add_argument(
+        "--mini-chat",
+        nargs="?",
+        const="",
+        metavar="SESSION_ID",
+        help="experimental: hpins-owned terminal chat loop; optionally pass SESSION_ID",
+    )
+    parser.add_argument(
+        "--mini-chat-dry-run",
+        action="store_true",
+        help="with --mini-chat, print hermes single-turn commands instead of executing them",
+    )
+    parser.add_argument(
+        "--pins-only",
+        action="store_true",
+        help="show only pinned sessions (or manage pinned only with --manage/--chat/--mini-chat)",
+    )
+    return parser.parse_args()
+
+
+def open_session(session_id):
+    subprocess.run(["hermes-session", session_id], check=False)
+
+
+def ensure_url_server():
+    try:
+        health = subprocess.run(
+            ["/usr/bin/curl", "-fsS", "--max-time", "0.3", "http://127.0.0.1:17776/health"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if health.returncode == 0:
+            return
+    except Exception:
+        pass
+    env = dict(os.environ)
+    env["PATH"] = "/Users/apple/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    subprocess.Popen(
+        ["/Users/apple/.local/bin/hermes-session-server"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+
+
+def get_pinned_ids():
+    # Use Python 3.11's leveldb package to read the locked LevelDB
+    # Copy to temp first to avoid lock contention
+    src = pathlib.Path.home() / "Library/Application Support/Hermes/Local Storage/leveldb"
+    if not src.exists():
+        return []
+
+    # Create temp copy
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dst = pathlib.Path(tmpdir) / "leveldb"
+        shutil.copytree(src, dst)
+
+        # Use Python 3.11 with leveldb package
+        py311 = "/usr/local/opt/python@3.11/bin/python3.11"
+        if not os.path.exists(py311):
+            return _get_pinned_ids_fallback(src)
+
+        script = f'''
+import leveldb, json, sys
+db = leveldb.LevelDB(r"{dst}")
+try:
+    val = db.Get(b"_file://\\x00\\x01hermes.desktop.pinnedSessions")
+    json_str = val[1:].decode("utf-8")
+    print(json.dumps(json.loads(json_str)))
+except Exception as e:
+    print("[]", file=sys.stderr)
+'''
+        result = subprocess.run([py311, "-c", script], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                return json.loads(result.stdout.strip())
+            except Exception:
+                pass
+
+    return _get_pinned_ids_fallback(src)
+
+
+def _get_pinned_ids_fallback(src):
+    """Fallback regex-based extraction from raw LevelDB files."""
+    text_parts = []
+    for p in sorted(src.glob("*"), key=lambda x: x.stat().st_mtime):
+        if p.suffix in {".log", ".ldb"}:
+            try:
+                text_parts.append(p.read_bytes().decode("utf-8", "ignore"))
+            except Exception:
+                pass
+    text = "\n".join(text_parts)
+    key = "hermes.desktop.pinnedSessions"
+    idx = text.find(key)
+    if idx == -1:
+        return []
+    window = text[idx:idx+50000]
+    session_ids = re.findall(r'\b(\d{8}_\d{6}_[a-f0-9]{6})\b', window)
+    seen = set()
+    result = []
+    for sid in session_ids:
+        if sid not in seen:
+            seen.add(sid)
+            result.append(sid)
+    return result
+
+
+def write_pinned_ids(new_ids):
+    """Write pinned session IDs to Hermes Desktop LevelDB. Hermes Desktop must not hold the LevelDB lock."""
+    src = pathlib.Path.home() / "Library/Application Support/Hermes/Local Storage/leveldb"
+    py311 = "/usr/local/opt/python@3.11/bin/python3.11"
+    if not src.exists():
+        raise RuntimeError(f"Hermes Desktop LevelDB not found: {src}")
+    if not os.path.exists(py311):
+        raise RuntimeError(f"Python 3.11 with leveldb not found: {py311}")
+
+    script = r'''
+import json, leveldb, pathlib, sys
+src = pathlib.Path.home() / "Library/Application Support/Hermes/Local Storage/leveldb"
+key = b"_file://\x00\x01hermes.desktop.pinnedSessions"
+new_ids = json.loads(sys.stdin.read())
+db = leveldb.LevelDB(str(src))
+db.Put(key, b"\x01" + json.dumps(new_ids).encode("utf-8"))
+print(len(new_ids))
+'''
+    result = subprocess.run(
+        [py311, "-c", script],
+        input=json.dumps(new_ids),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "unknown error").strip()
+        raise RuntimeError(err)
+
+
+def archive_sessions(con, ids):
+    if not ids:
+        return 0
+    con.executemany("update sessions set archived = 1 where id = ?", [(sid,) for sid in ids])
+    con.commit()
+    return con.total_changes
+
+
+def rows_with_fallback(con, ids, compact=True):
+    rows = session_rows(con, ids)
+    empty = [sid for sid, row in rows.items() if row and not row[1]]
+    if empty:
+        fallback = fallback_titles(con, empty, max_len=80 if compact else None)
+        for sid, title in fallback.items():
+            row = rows[sid]
+            rows[sid] = (row[0], title, row[2], row[3])
+    return rows
+
+
+def _pid_alive(pid):
+    try:
+        return int(pid) > 0 and os.kill(int(pid), 0) is None
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def active_session_ids_from_registry():
+    """Return exact active Hermes session IDs when Hermes' lease registry exists."""
+    path = pathlib.Path.home() / ".hermes/runtime/active_sessions.json"
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return set()
+    entries = data.get("entries") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return set()
+    result = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        sid = str(entry.get("session_id") or "").strip()
+        if sid and _pid_alive(entry.get("pid")):
+            result.add(sid)
+    return result
+
+
+def open_session_ids(con):
+    """Return sessions that are not finalized in state.db (useful but less exact than live registry)."""
+    try:
+        return {
+            row[0]
+            for row in con.execute(
+                "select id from sessions where archived = 0 and ended_at is null"
+            )
+        }
+    except Exception:
+        return set()
+
+
+def status_marker(sid, live_ids=None, open_ids=None):
+    live_ids = live_ids or set()
+    open_ids = open_ids or set()
+    if sid in live_ids:
+        return "●"  # exact live process via active_sessions.json
+    if sid in open_ids:
+        return "◌"  # unclosed/open in DB; may be idle or stale
+    return " "
+
+
+def mark_title(title, sid, live_ids=None, open_ids=None):
+    marker = status_marker(sid, live_ids, open_ids)
+    return f"{marker} {title}" if marker.strip() else f"  {title}"
+
+
+def build_preview_dir(con, lines):
+    """Pre-generate one text file per session for fzf --preview."""
+    tmpdir = tempfile.mkdtemp(prefix="hpins_preview_")
+    for line in lines:
+        parts = line.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        sid = parts[1]
+        title = parts[2] if len(parts) > 2 else "(untitled)"
+
+        meta = con.execute(
+            "select source, datetime(started_at,'unixepoch') from sessions where id = ?",
+            (sid,),
+        ).fetchone()
+
+        msgs = con.execute(
+            "select role, content from messages where session_id = ? order by id limit 60",
+            (sid,),
+        ).fetchall()
+
+        out = []
+        out.append(f"  {title}")
+        if meta:
+            source, ts = meta
+            out.append(f"  {source or ''}  {ts or ''}")
+        out.append("  " + "\u2500" * 58)
+        out.append("")
+
+        for role, content in msgs:
+            if not content:
+                continue
+            label = "You" if role == "user" else " AI"
+            content = content.strip()
+            clines = content.split("\n")
+            MAX_L, MAX_C = 7, 320
+            display = []
+            chars = 0
+            truncated = False
+            for cl in clines[:MAX_L]:
+                if chars + len(cl) > MAX_C:
+                    rem = MAX_C - chars
+                    if rem > 0:
+                        display.append(cl[:rem] + "\u2026")
+                    truncated = True
+                    break
+                display.append(cl)
+                chars += len(cl)
+            if not truncated and len(clines) > MAX_L:
+                truncated = True
+            if truncated:
+                display.append("\u2026")
+            if display:
+                out.append(f"  [{label}]  {display[0]}")
+                for dl in display[1:]:
+                    out.append(f"          {dl}")
+            out.append("")
+
+        with open(os.path.join(tmpdir, sid), "w") as f:
+            f.write("\n".join(out))
+
+    return tmpdir
+
+
+def build_selector_lines(args, con, pinned_ids, pinned_rows):
+    """Build PIN/REC rows for fzf-based selection UIs."""
+    pinned_set = set(pinned_ids)
+    live_ids = getattr(args, "live_session_ids", set())
+    open_ids = getattr(args, "open_session_ids", set())
+    lines = []
+    for sid in pinned_ids:
+        row = pinned_rows.get(sid)
+        title = row[1] if row else "(untitled)"
+        kind = status_marker(sid, live_ids, open_ids) + " PIN"
+        lines.append(f"{kind}\t{sid}\t{title}")
+
+    if args.pins_only:
+        return lines
+
+    params = []
+    limit_sql = ""
+    if not args.all_recent:
+        limit_sql = "limit ?"
+        params.append(max(args.recent + len(pinned_set), 0))
+    q = f"""
+    select id, coalesce(title, ''), source, datetime(started_at,'unixepoch') as started_at
+    from sessions
+    where archived = 0
+    order by started_at desc
+    {limit_sql}
+    """
+    recent_ids = [r[0] for r in con.execute(q, params)]
+    recent_rows = rows_with_fallback(con, recent_ids, compact=True)
+    shown = 0
+    target = None if args.all_recent else max(args.recent, 0)
+    for row in con.execute(q, params):
+        sid = row[0]
+        if sid in pinned_set:
+            continue
+        if target is not None and shown >= target:
+            break
+        recent_row = recent_rows.get(sid)
+        title = recent_row[1] if recent_row else (row[1] or "(untitled)")
+        kind = status_marker(sid, live_ids, open_ids) + " REC"
+        lines.append(f"{kind}\t{sid}\t{title}")
+        shown += 1
+    return lines
+
+
+def resume_chat(session_id, dry_run=False):
+    """Resume a Hermes session as chat in the current terminal."""
+    session_id = (session_id or "").strip()
+    if not session_id:
+        sys.exit("session_id is required")
+    if not re.match(r"^[A-Za-z0-9_:-]+$", session_id):
+        sys.exit("invalid session_id")
+    cmd = ["hermes", "--resume", session_id, "--cli"]
+    if dry_run:
+        print(" ".join(cmd))
+        return
+    os.execvp(cmd[0], cmd)
+
+
+def pick_session_with_fzf(args, con, pinned_ids, pinned_rows, *, prompt, header):
+    """Pick one PIN/REC session using fzf with transcript preview."""
+    fzf = shutil.which("fzf")
+    if not fzf:
+        sys.exit("fzf is required. Install with: brew install fzf")
+
+    lines = build_selector_lines(args, con, pinned_ids, pinned_rows)
+    if not lines:
+        return None
+
+    preview_dir = build_preview_dir(con, lines)
+    try:
+        proc = subprocess.run(
+            [
+                fzf,
+                "--delimiter=\t",
+                "--with-nth=1,3",
+                f"--header={header}",
+                f"--prompt={prompt}",
+                f"--preview=cat {preview_dir}/{{2}} 2>/dev/null || echo '(no preview)'",
+                "--preview-window=right:55%:wrap",
+            ],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+
+    selected = proc.stdout.splitlines()[0].split("\t", 2)
+    if len(selected) < 2:
+        print("Invalid selection.", file=sys.stderr)
+        return None
+    return selected[1], selected[2] if len(selected) > 2 else selected[1]
+
+
+def run_chat_picker(args, con, pinned_ids, pinned_rows):
+    """Pick a session with fzf preview, then resume it in this terminal."""
+    direct_id = args.chat.strip() if isinstance(args.chat, str) else ""
+    if direct_id:
+        resume_chat(direct_id, dry_run=args.chat_dry_run)
+        return
+
+    picked = pick_session_with_fzf(
+        args,
+        con,
+        pinned_ids,
+        pinned_rows,
+        prompt="hpins chat> ",
+        header="ENTER chat in this terminal  ESC cancel",
+    )
+    if not picked:
+        print("Cancelled." if build_selector_lines(args, con, pinned_ids, pinned_rows) else "No sessions to chat.")
+        return
+    resume_chat(picked[0], dry_run=args.chat_dry_run)
+
+
+def print_session_preview(con, session_id, limit=12):
+    """Print a compact recent transcript preview for mini-chat."""
+    row = con.execute(
+        "select coalesce(title, ''), source, datetime(started_at,'unixepoch') from sessions where id = ?",
+        (session_id,),
+    ).fetchone()
+    title = (row[0] if row else "") or session_id
+    print(f"\n== {title} ==")
+    if row:
+        print(f"{row[1] or ''}  {row[2] or ''}")
+    msgs = con.execute(
+        "select role, content from messages where session_id = ? and content is not null and content != '' order by id desc limit ?",
+        (session_id, limit),
+    ).fetchall()
+    for role, content in reversed(msgs):
+        label = "You" if role == "user" else "AI" if role == "assistant" else role
+        text = " ".join((content or "").strip().split())
+        if len(text) > 220:
+            text = text[:217] + "…"
+        print(f"[{label}] {text}")
+    print()
+
+
+def run_hermes_mini_turn(session_id, message, *, dry_run=False):
+    """Run one Hermes turn against a resumed session and return latest session id."""
+    cmd = ["hermes", "chat", "--resume", session_id, "--cli", "-Q", "-q", message]
+    if dry_run:
+        print("+ " + " ".join(shlex.quote(part) for part in cmd))
+        return session_id
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+        return session_id
+
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        if err:
+            print(err, file=sys.stderr)
+        print(f"[hpins mini-chat] hermes exited {proc.returncode}", file=sys.stderr)
+        return session_id
+
+    m = re.search(r"session_id:\s*(\S+)", proc.stderr or "")
+    return m.group(1) if m else session_id
+
+
+def mini_chat_loop(con, session_id, title, *, dry_run=False):
+    """Tiny hpins-owned chat loop. Each message is one resumed Hermes turn."""
+    print(f"hpins mini-chat: {title or session_id}")
+    print("commands: /switch /exit /id /open /preview")
+    print_session_preview(con, session_id, limit=8)
+
+    current_id = session_id
+    while True:
+        try:
+            message = input(f"hpins[{(title or current_id)[:40]}]> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "exit", current_id
+        if not message:
+            continue
+        cmd = message.lower()
+        if cmd in {"/exit", "/quit", "exit", "quit", ":q"}:
+            return "exit", current_id
+        if cmd in {"/switch", "/back", "/main", "/list"}:
+            return "switch", current_id
+        if cmd == "/id":
+            print(current_id)
+            continue
+        if cmd == "/open":
+            resume_chat(current_id, dry_run=dry_run)
+            return "exit", current_id
+        if cmd == "/preview":
+            print_session_preview(con, current_id)
+            continue
+        current_id = run_hermes_mini_turn(current_id, message, dry_run=dry_run)
+
+
+def run_mini_chat_picker(args, con, pinned_ids, pinned_rows):
+    """Pick a session, then chat inside hpins without launching Hermes' REPL/TUI."""
+    direct_id = args.mini_chat.strip() if isinstance(args.mini_chat, str) else ""
+    picked = None
+    if direct_id:
+        row = session_rows(con, [direct_id]).get(direct_id)
+        picked = (direct_id, row[1] if row else direct_id)
+
+    while True:
+        if not picked:
+            picked = pick_session_with_fzf(
+                args,
+                con,
+                pinned_ids,
+                pinned_rows,
+                prompt="hpins mini> ",
+                header="ENTER mini-chat here  ESC cancel",
+            )
+            if not picked:
+                print("Cancelled." if build_selector_lines(args, con, pinned_ids, pinned_rows) else "No sessions to mini-chat.")
+                return
+        action, _current_id = mini_chat_loop(con, picked[0], picked[1], dry_run=args.mini_chat_dry_run)
+        if action != "switch":
+            return
+        picked = None
+
+
+def run_manage(args, con, pinned_ids, pinned_rows):
+    fzf = shutil.which("fzf")
+    if not fzf:
+        sys.exit("fzf is required for --manage. Install with: brew install fzf")
+
+    pinned_set = set(pinned_ids)
+    lines = []
+    for sid in pinned_ids:
+        row = pinned_rows.get(sid)
+        title = row[1] if row else "(untitled)"
+        lines.append(f"PIN\t{sid}\t{title}")
+
+    if not args.pins_only:
+        params = []
+        limit_sql = ""
+        if not args.all_recent:
+            limit_sql = "limit ?"
+            params.append(max(args.recent + len(pinned_set), 0))
+        q = f"""
+        select id, coalesce(title, ''), source, datetime(started_at,'unixepoch') as started_at
+        from sessions
+        where archived = 0
+        order by started_at desc
+        {limit_sql}
+        """
+        recent_ids = [r[0] for r in con.execute(q, params)]
+        recent_rows = rows_with_fallback(con, recent_ids, compact=True)
+        shown = 0
+        target = None if args.all_recent else max(args.recent, 0)
+        for row in con.execute(q, params):
+            sid = row[0]
+            if sid in pinned_set:
+                continue
+            if target is not None and shown >= target:
+                break
+            recent_row = recent_rows.get(sid)
+            title = recent_row[1] if recent_row else (row[1] or "(untitled)")
+            lines.append(f"REC\t{sid}\t{title}")
+            shown += 1
+
+    if not lines:
+        print("No sessions to manage.")
+        return
+
+    preview_dir = build_preview_dir(con, lines)
+    try:
+        proc = subprocess.run(
+            [
+                fzf,
+                "--multi",
+                "--delimiter=\t",
+                "--with-nth=1,3",
+                "--header=TAB select  ENTER to unpin/archive  ESC cancel",
+                "--prompt=hpins> ",
+                f"--preview=cat {preview_dir}/{{2}} 2>/dev/null || echo '(no preview)'",
+                "--preview-window=right:55%:wrap",
+            ],
+            input="\n".join(lines) + "\n",
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        shutil.rmtree(preview_dir, ignore_errors=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        print("Cancelled.")
+        return
+
+    selected = [line.split("\t", 2) for line in proc.stdout.splitlines() if line.strip()]
+    selected_pins = [sid for kind, sid, *_ in selected if kind == "PIN"]
+    selected_recents = [sid for kind, sid, *_ in selected if kind == "REC"]
+
+    if selected_pins:
+        new_pins = [sid for sid in pinned_ids if sid not in set(selected_pins)]
+        try:
+            write_pinned_ids(new_pins)
+            print(f"Unpinned {len(selected_pins)} pinned session(s).")
+        except Exception as e:
+            print("Failed to update pinned sessions. Quit Hermes Desktop and retry.", file=sys.stderr)
+            print(str(e), file=sys.stderr)
+            if selected_recents:
+                print("Recent sessions were not archived because pin update failed.", file=sys.stderr)
+            return
+
+    if selected_recents:
+        archive_sessions(con, selected_recents)
+        print(f"Archived {len(selected_recents)} recent session(s).")
+
+    print("Done.")
+
+
+def session_rows(con, ids):
+    if not ids:
+        return {}
+    q = f"""
+    select s.id, coalesce(s.title, ''), s.source, datetime(s.started_at,'unixepoch') as started_at
+    from sessions s
+    where s.id in ({','.join('?' for _ in ids)})
+    """
+    return {r[0]: r for r in con.execute(q, ids)}
+
+
+def fallback_titles(con, ids, max_len=None):
+    """Fetch first user message for sessions with empty titles."""
+    if not ids:
+        return {}
+    placeholders = ','.join('?' for _ in ids)
+    q = f"""
+    select m.session_id, m.content
+    from messages m
+    where m.session_id in ({placeholders})
+      and m.role = 'user'
+      and m.content is not null and m.content != ''
+      and m.id = (
+        select min(id) from messages
+        where session_id = m.session_id and role = 'user' and content is not null and content != ''
+      )
+    """
+    result = {r[0]: r[1] for r in con.execute(q, ids)}
+    if max_len:
+        return {sid: (title[:max_len] + "…" if len(title) > max_len else title) for sid, title in result.items()}
+    return result
+
+
+def maybe_link(text, sid, links_enabled):
+    if not links_enabled:
+        return text
+    return OSC.format(url=f"hermes-session://resume/{sid}", text=text)
+
+
+def print_row(prefix, sid, row=None, links_enabled=False, live_ids=None, open_ids=None):
+    marker = status_marker(sid, live_ids, open_ids)
+    display_prefix = f"{marker}{prefix}" if marker.strip() else f" {prefix}"
+    linked_sid = maybe_link(sid, sid, links_enabled)
+    if row:
+        title = row[1] or "(untitled)"
+        linked_title = maybe_link(title, sid, links_enabled)
+        print(f"{display_prefix}\t{linked_sid}\t{linked_title}\t{row[2]}\t{row[3]}")
+    else:
+        print(f"{display_prefix}\t{linked_sid}\t<MISSING FROM state.db>")
+
+
+def main():
+    args = parse_args()
+    if not args.verbose:
+        args.compact = True
+    if args.command == "open":
+        open_session(args.session_id)
+        return
+
+    links_enabled = args.links or (sys.stdout.isatty() and not args.no_links and os.environ.get("TERM") != "dumb")
+    if links_enabled:
+        ensure_url_server()
+
+    db = pathlib.Path.home() / ".hermes/state.db"
+    if not db.exists():
+        sys.exit(f"Hermes state DB not found: {db}")
+
+    pinned_ids = get_pinned_ids()
+    con = sqlite3.connect(db)
+    pinned_rows = session_rows(con, pinned_ids)
+    args.live_session_ids = active_session_ids_from_registry()
+    args.open_session_ids = open_session_ids(con)
+
+    # Fetch fallback titles (first user message) for sessions missing titles
+    empty_titles = [sid for sid, row in pinned_rows.items() if row and not row[1]]
+    if empty_titles:
+        fallback = fallback_titles(con, empty_titles, max_len=80 if args.compact else None)
+        for sid, title in fallback.items():
+            row = pinned_rows[sid]
+            pinned_rows[sid] = (row[0], title, row[2], row[3])
+
+    if args.mini_chat is not None:
+        run_mini_chat_picker(args, con, pinned_ids, pinned_rows)
+        return
+
+    if args.chat is not None:
+        run_chat_picker(args, con, pinned_ids, pinned_rows)
+        return
+
+    if args.manage:
+        run_manage(args, con, pinned_ids, pinned_rows)
+        return
+
+    if args.compact:
+        printed_pins = False
+        if pinned_ids:
+            print("== PINNED ==")
+            for sid in pinned_ids:
+                row = pinned_rows.get(sid)
+                title = row[1] if row else "(untitled)"
+                title = mark_title(title, sid, args.live_session_ids, args.open_session_ids)
+                print(maybe_link(title, sid, links_enabled))
+                printed_pins = True
+        if args.pins_only:
+            return
+        shown = 0
+        target = None if args.all_recent else max(args.recent, 0)
+        params = []
+        limit_sql = ""
+        if not args.all_recent:
+            limit_sql = "limit ?"
+            params.append(max(args.recent + len(set(pinned_ids)), 0))
+        q = f"""
+        select id, coalesce(title, ''), started_at from sessions
+        where archived = 0 order by started_at desc {limit_sql}
+        """
+        recent_ids = [r[0] for r in con.execute(q, params)]
+        recent_rows = session_rows(con, recent_ids)
+        # Fetch fallback titles for recent sessions
+        empty_recent = [sid for sid, row in recent_rows.items() if row and not row[1]]
+        if empty_recent:
+            fallback = fallback_titles(con, empty_recent, max_len=80 if args.compact else None)
+            for sid, title in fallback.items():
+                row = recent_rows[sid]
+                recent_rows[sid] = (row[0], title, row[2], row[3])
+        for row in con.execute(q, params):
+            sid = row[0]
+            if sid in set(pinned_ids):
+                continue
+            if target is not None and shown >= target:
+                break
+            if shown == 0:
+                if printed_pins:
+                    print()
+                print(f"== RECENT {'ALL' if args.all_recent else args.recent} ==")
+            recent_row = recent_rows.get(sid)
+            title = recent_row[1] if recent_row else "(untitled)"
+            title = mark_title(title, sid, args.live_session_ids, args.open_session_ids)
+            print(maybe_link(title, sid, links_enabled))
+            shown += 1
+        return
+
+    print("== PINNED ==")
+    if pinned_ids:
+        for sid in pinned_ids:
+            print_row("PIN", sid, pinned_rows.get(sid), links_enabled, args.live_session_ids, args.open_session_ids)
+    else:
+        print("(none)")
+
+    if args.pins_only:
+        return
+
+    print()
+    print(f"== RECENT {'ALL' if args.all_recent else args.recent} ==")
+    pinned_set = set(pinned_ids)
+    params = []
+    limit_sql = ""
+    if not args.all_recent:
+        limit_sql = "limit ?"
+        # Over-fetch a little so pinned rows skipped from recents do not shrink the list too much.
+        params.append(max(args.recent + len(pinned_set), 0))
+
+    q = f"""
+    select id, coalesce(title, ''), source, datetime(started_at,'unixepoch') as started_at
+    from sessions
+    where archived = 0
+    order by started_at desc
+    {limit_sql}
+    """
+
+    # Collect recent IDs to fetch fallback titles
+    params_copy = list(params)
+    recent_ids = [r[0] for r in con.execute(q, params_copy)]
+    recent_rows = session_rows(con, recent_ids)
+    empty_recent = [sid for sid, row in recent_rows.items() if row and not row[1]]
+    if empty_recent:
+        fallback = fallback_titles(con, empty_recent, max_len=80 if args.compact else None)
+        for sid, title in fallback.items():
+            row = recent_rows[sid]
+            recent_rows[sid] = (row[0], title, row[2], row[3])
+
+    shown = 0
+    target = None if args.all_recent else max(args.recent, 0)
+    for row in con.execute(q, params):
+        sid = row[0]
+        if sid in pinned_set:
+            continue
+        if target is not None and shown >= target:
+            break
+        recent_row = recent_rows.get(sid)
+        if recent_row:
+            print_row("REC", sid, recent_row, links_enabled, args.live_session_ids, args.open_session_ids)
+        else:
+            print_row("REC", sid, row, links_enabled, args.live_session_ids, args.open_session_ids)
+        shown += 1
+    if shown == 0:
+        print("(none)")
+
+
+if __name__ == "__main__":
+    main()
